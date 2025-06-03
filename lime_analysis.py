@@ -3,92 +3,66 @@ import pandas as pd
 from lime.lime_text import LimeTextExplainer
 import matplotlib.pyplot as plt
 from collections import defaultdict
-from googleapiclient import discovery
-import time
-from googleapiclient.errors import HttpError
 
-# Read dataset and initialize API client
-df = pd.read_csv('balanced_train_1000.csv')
-API_KEY = 'AIzaSyBf-jir2IV0S6DhflmQmpivAKwbGdSqL3s'
-client = discovery.build(
-    "commentanalyzer",
-    "v1alpha1",
-    developerKey=API_KEY,
-    discoveryServiceUrl="https://commentanalyzer.googleapis.com/$discovery/rest?version=v1alpha1"
-)
+# Read dataset with cached scores
+df = pd.read_csv('comments_with_scores.csv')
 
-class CachedToxicityScorer:
-    def __init__(self, client):
-        self.client = client
-        self.cache = {}
-        self.last_request_time = 0
-        self.min_request_interval = 1.0  # Minimum 1 second between requests
+def preprocess_text(text):
+    """Normalize text by removing extra spaces"""
+    return ' '.join(text.split())
+
+def get_toxicity_scores(examples):
+    """Get toxicity scores from cached CSV file"""
+    # Create lookup dict for faster access
+    text_scores = dict(zip(df['comment_text'].apply(preprocess_text), df['toxicity_score']))
+    
+    scores = []
+    for text in examples:
+        orig_text = ' '.join([word for word in text.split() if word != 'MASKED'])
+        orig_text = preprocess_text(orig_text)
         
-    def _wait_for_rate_limit(self):
-        """Ensure we wait appropriate time between requests"""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.min_request_interval:
-            time.sleep(self.min_request_interval - elapsed)
-        self.last_request_time = time.time()
-
-    def _get_score_with_retries(self, text, max_retries=5):
-        """Make API call with exponential backoff"""
-        retry_count = 0
-        while retry_count < max_retries:
-            try:
-                self._wait_for_rate_limit()
-                analyze_request = {
-                    'comment': {'text': text},
-                    'requestedAttributes': {'TOXICITY': {}},
-                    'languages': ['en']
-                }
-                response = self.client.comments().analyze(body=analyze_request).execute()
-                return response['attributeScores']['TOXICITY']['summaryScore']['value']
-            except HttpError as e:
-                if e.resp.status == 429:  # Rate limit error
-                    retry_count += 1
-                    sleep_time = (2 ** retry_count) + np.random.uniform(0, 1)
-                    print(f"Rate limit hit, waiting {sleep_time:.2f} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    print(f"HTTP Error {e.resp.status}: {str(e)}")
-                    return np.nan
-            except Exception as e:
-                print(f"Unexpected error: {str(e)}")
-                return np.nan
-        print(f"Max retries ({max_retries}) exceeded for text: {text[:50]}...")
-        return np.nan
-        
-    def get_scores(self, examples):
-        scores = []
-        for text in examples:
-            if text in self.cache:
-                scores.append(self.cache[text])
-            else:
-                score = self._get_score_with_retries(text)
-                self.cache[text] = score
-                scores.append(score)
-                    
-        return np.array(scores).reshape(-1, 1)
+        if orig_text in text_scores:
+            score = text_scores[orig_text]
+            if 'MASKED' in text:
+                # Scale score based on remaining words
+                orig_words = len(orig_text.split())
+                remaining_words = len([w for w in text.split() if w != 'MASKED'])
+                score = score * (remaining_words/orig_words)
+            scores.append(score)
+        else:
+            scores.append(text_scores.values().mean())
+    
+    return np.array(scores).reshape(-1, 1)  # Return as column vector
 
 def aggregate_word_importances(examples, scorer, num_features=20):
-    explainer = LimeTextExplainer()
+    # Configure LIME for faster processing
+    explainer = LimeTextExplainer(
+        class_names=['toxicity'],
+        split_expression=lambda x: x.split(),
+        bow=False,  # Faster processing
+        mask_string='MASKED'
+    )
     word_scores = defaultdict(float)
-
-    # Get initial scores for full examples
-    base_scores = scorer.get_scores(examples)
     
-    for text, base_score in zip(examples, base_scores.flatten()):
+    print(f"Analyzing {len(examples)} examples...")
+    for i, (text, base_score) in enumerate(zip(examples, scorer(examples))):
+        print(f"Processing example {i+1}/{len(examples)}...")
         exp = explainer.explain_instance(
             text,
-            scorer.get_scores,
-            num_features=100
+            scorer,
+            num_features=50,  # Reduced from 100
+            num_samples=500,  # Reduced sample size
+            top_labels=1
         )
-        for word, score in exp.as_list():
-            word_scores[word] += score
-
-    # Sort words by their aggregated scores
-    sorted_words = sorted(word_scores.items(), key=lambda x: x[1], reverse=True)
+        # Normalize scores relative to base toxicity
+        for word, score in exp.as_list(label=0):
+            word_scores[word] += score / max(abs(base_score), 0.001)
+    
+    # Sort and scale scores for better interpretability  
+    max_score = max(abs(score) for score in word_scores.values())
+    scaled_scores = {word: score/max_score for word, score in word_scores.items()}
+    
+    sorted_words = sorted(scaled_scores.items(), key=lambda x: x[1], reverse=True)
     top_positive = sorted_words[:num_features]
     top_negative = sorted_words[-num_features:][::-1]  # Reverse for most negative first
 
@@ -126,27 +100,17 @@ def plot_word_importances(word_scores, title):
 
 
 def main():
-    # Sample 5 random examples
-    sampled_df = df.sample(n=5, random_state=42)
+    # Sample 5 random examples from non-empty texts
+    mask = df['comment_text'].str.strip().str.len() > 0
+    sampled_df = df[mask].sample(n=5, random_state=42)
     examples = sampled_df['comment_text'].tolist()
     
-    # Initialize cached scorer
-    scorer = CachedToxicityScorer(client)
-    
-    # Get scores using cached scorer
-    scores = scorer.get_scores(examples).flatten().tolist()
+    # Get scores
+    scores = get_toxicity_scores(examples).flatten().tolist()
     print("Toxicity scores:", scores)
     
-    # Filter out any failed scores
-    filtered_examples = []
-    filtered_scores = []
-    for text, score in zip(examples, scores):
-        if score is not None and not pd.isna(score):
-            filtered_examples.append(text)
-            filtered_scores.append(score)
-
     print("Aggregating word importances...")
-    top_positive, top_negative = aggregate_word_importances(filtered_examples, scorer, num_features=20)
+    top_positive, top_negative = aggregate_word_importances(examples, get_toxicity_scores, num_features=20)
 
     print("Top 20 positively correlated words:", top_positive)
     print("Top 20 negatively correlated words:", top_negative)
