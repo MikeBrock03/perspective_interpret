@@ -14,7 +14,7 @@ from sklearn.linear_model import LinearRegression
 
 # Configuration variables for testing
 TEST_CONFIG = {
-    'max_samples': 500,  # Number of texts to analyze (500 toxic + 500 non-toxic)
+    'max_samples': 1000,  # Number of texts to analyze (500 toxic + 500 non-toxic)
     'max_words': 50,    # Maximum number of words to analyze per text
     'rate_limit_delay': 1.2,  # Delay between API calls in seconds
     'min_word_frequency': 5,  # Minimum number of times a word must appear to be included in analysis

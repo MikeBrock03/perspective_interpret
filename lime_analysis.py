@@ -3,22 +3,33 @@ import pandas as pd
 from lime.lime_text import LimeTextExplainer
 import xgboost as xgb
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LinearRegression
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import re
 import string
 
+# Configuration variables
+TEST_CONFIG = {
+    'max_samples': 998,  # Number of texts to analyze
+    'max_words': 50,    # Maximum number of words to analyze per text
+    'min_word_frequency': 5,  # Minimum number of times a word must appear
+    'top_n_words': 20,   # Number of top words to show in visualizations
+    'use_xgboost': True,  # Flag to use XGBoost instead of linear regression
+    'common_words': {  # Words to exclude from analysis
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'is', 'are', 'at', 'to', 'it', 'for', 
+        'of', 'with', 'by', 'from', 'up', 'about', 'into', 'over', 'after', 'usertimothyhorrigan', 
+        'too', 'this', 'their'
+    }
+}
+
 # Read dataset containing text examples and their pre-computed toxicity scores
 df = pd.read_csv('comments_with_scores.csv')
 
-# Add stopwords list
-STOPWORDS = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'is', 'are', 'at', 'to', 'it', 'for', 
-            'of', 'with', 'by', 'from', 'up', 'about', 'into', 'over', 'after', 'usertimothyhorrigan', 'too', 'this', 'their'}
-
 def clean_word(word):
     """Clean and normalize individual words"""
-    # Remove numbers and special characters
-    word = re.sub(r'[^a-zA-Z\s]', '', word)
+    # Remove special characters and punctuation
+    word = re.sub(r'[^a-zA-Z0-9\s]', '', word)
     # Convert to lowercase
     return word.lower().strip()
 
@@ -27,272 +38,31 @@ def preprocess_text(text):
     # Split text into words and clean each word
     words = [clean_word(word) for word in text.split()]
     # Remove empty strings and stopwords
-    words = [w for w in words if w and w not in STOPWORDS]
+    words = [w for w in words if w and w not in TEST_CONFIG['common_words']]
     return ' '.join(words)
 
-def get_toxicity_scores(examples):
-    """Get toxicity scores using word-level toxicity analysis with non-linear weighting"""
-    # Create lookup dict for faster access
-    text_scores = dict(zip(df['comment_text'].apply(preprocess_text), df['toxicity_score']))
-    
-    # Build word-level toxicity dictionary
-    word_toxicity = defaultdict(list)
-    for text, score in text_scores.items():
-        words = text.split()
-        for word in words:
-            word_toxicity[word].append(score)
-    
-    # Calculate average toxicity per word
-    word_toxicity = {word: np.mean(scores) for word, scores in word_toxicity.items()}
-    max_word_toxicity = max(word_toxicity.values())
-    
-    # Normalize word toxicity scores to [0, 1]
-    word_toxicity = {word: score/max_word_toxicity for word, score in word_toxicity.items()}
-    
-    default_score = np.mean(list(text_scores.values()))
-    
-    scores = []
-    for text in examples:
-        # Get original text by removing MASKED tokens
-        words = [word for word in text.split() if word != 'MASKED']
-        if not words:
-            scores.append(default_score)
-            continue
-            
-        # Calculate composite score using exponential weighting
-        word_scores = [word_toxicity.get(word, 0.5) for word in words]
-        
-        # Use exponential weighting to amplify impact of toxic words
-        weighted_score = np.mean([np.exp(2 * score) for score in word_scores])
-        
-        # Normalize back to [0, 1] range
-        normalized_score = (weighted_score - 1) / (np.e**2 - 1)
-        
-        if 'MASKED' in text:
-            # Scale based on masked ratio
-            mask_ratio = len([w for w in text.split() if w == 'MASKED']) / len(text.split())
-            normalized_score *= (1 - 0.5 * mask_ratio)  # Reduce score based on masked portion
-            
-        scores.append(normalized_score)
-    
-    return np.array(scores).reshape(-1, 1)
-
-def get_toxicity_scores_idf_weighted(examples):
-    """
-    Get toxicity scores using toxicity-adjusted IDF weighting.
-    Preserves importance of toxic terms even when frequent in dataset.
-    
-    IDF (Inverse Document Frequency) is crucial because:
-    1. It reduces impact of common words that appear in many documents
-    2. It amplifies impact of rare but significant toxic terms
-    3. It helps identify domain-specific toxic language patterns
-    
-    For example:
-    - Common insults (high freq, low IDF) get lower weight
-    - Rare slurs (low freq, high IDF) get higher weight
-    """
-    # Precompute word-level toxicity
-    text_scores = dict(zip(df['comment_text'].apply(preprocess_text), df['toxicity_score']))
-    word_toxicity = defaultdict(list)
-    doc_freq = defaultdict(int)
-    total_docs = 0
-
-    # Build word toxicity and document frequency
-    for text, score in text_scores.items():
-        words = set(text.split())
-        total_docs += 1
-        for word in words:
-            doc_freq[word] += 1
-        for word in text.split():
-            word_toxicity[word].append(score)
-    word_toxicity = {word: np.mean(scores) for word, scores in word_toxicity.items()}
-
-    # Calculate toxicity-adjusted IDF that preserves weight of toxic terms
-    idf = {}
-    for word in word_toxicity:
-        word_tox = word_toxicity[word]
-        freq = doc_freq[word]
-        
-        # If word has high toxicity (>0.7), reduce IDF penalty
-        if word_tox > 0.7:
-            # Reduce effective frequency for toxic words
-            effective_freq = freq * (1.3 - word_tox)  # Higher toxicity = lower effective frequency
-            idf[word] = np.log((1 + total_docs) / (1 + effective_freq)) + 1
-        else:
-            # Regular IDF for non-toxic words
-            idf[word] = np.log((1 + total_docs) / (1 + freq)) + 1
-
-    # Normalize word toxicity to [0, 1]
-    max_word_tox = max(word_toxicity.values())
-    word_toxicity = {word: score / max_word_tox for word, score in word_toxicity.items()}
-
-    default_score = np.mean(list(text_scores.values()))
-
-    scores = []
-    for text in examples:
-        words = [word for word in text.split() if word != 'MASKED']
-        if not words:
-            scores.append(default_score)
-            continue
-
-        # Compute weighted sum of word toxicities using IDF
-        toks = [word_toxicity.get(word, 0.5) for word in words]
-        idfs = [idf.get(word, 1.0) for word in words]
-        weighted_sum = np.sum([t * w for t, w in zip(toks, idfs)])
-        total_weight = np.sum(idfs) if idfs else 1.0
-
-        # Final score: sigmoid to [0,1]
-        score = weighted_sum / total_weight
-        score = 1 / (1 + np.exp(-6 * (score - 0.5)))  # Sharper sigmoid
-
-        if 'MASKED' in text:
-            mask_ratio = len([w for w in text.split() if w == 'MASKED']) / len(text.split())
-            score *= (1 - 0.5 * mask_ratio)
-
-        scores.append(score)
-
-    return np.array(scores).reshape(-1, 1)
-
-def get_toxicity_scores_avg_nonlinear(examples):
-    """
-    Get toxicity scores by averaging word toxicities and applying a non-linear transformation.
-    This does not penalize frequent toxic words.
-    """
-    # Build text_scores and word_toxicity
-    text_scores = dict(zip(df['comment_text'].apply(preprocess_text), df['toxicity_score']))
-    word_toxicity = defaultdict(list)
-    for text, score in text_scores.items():
-        for word in text.split():
-            word_toxicity[word].append(score)
-    word_toxicity = {word: np.mean(scores) for word, scores in word_toxicity.items()}
-    max_word_tox = max(word_toxicity.values())
-    word_toxicity = {word: score / max_word_tox for word, score in word_toxicity.items()}
-    default_score = np.mean(list(text_scores.values()))
-
-    scores = []
-    for text in examples:
-        words = [word for word in text.split() if word != 'MASKED']
-        if not words:
-            scores.append(default_score)
-            continue
-        toks = [word_toxicity.get(word, 0.5) for word in words]
-        avg_score = np.mean(toks)
-        # Non-linear transformation to emphasize high toxicity
-        score = 1 / (1 + np.exp(-6 * (avg_score - 0.5)))
-        if 'MASKED' in text:
-            mask_ratio = len([w for w in text.split() if w == 'MASKED']) / len(text.split())
-            score *= (1 - 0.5 * mask_ratio)
-        scores.append(score)
-    return np.array(scores).reshape(-1, 1)
-
-def get_weighted_toxicity_scores(examples):
-    """
-    Enhanced toxicity scoring that considers:
-    - Word context (surrounding words affect toxicity)
-    - Position effects (emphasized start/end)
-    - Repetition effects (repeated toxic words have diminishing returns)
-    - Multi-level scoring (individual and contextual toxicity)
-    """
-    # Build base word toxicity dictionary
-    text_scores = dict(zip(df['comment_text'].apply(preprocess_text), df['toxicity_score']))
-    word_toxicity = defaultdict(list)
-    context_toxicity = defaultdict(list)
-    
-    # Calculate word-level and context-level toxicity
-    for text, score in text_scores.items():
-        words = text.split()
-        # Track individual word toxicity
-        for word in words:
-            word_toxicity[word].append(score)
-        
-        # Track contextual toxicity (bigrams)
-        if len(words) > 1:
-            for i in range(len(words)-1):
-                bigram = (words[i], words[i+1])
-                context_toxicity[bigram].append(score)
-    
-    # Calculate base toxicity scores
-    word_stats = {word: np.mean(scores) for word, scores in word_toxicity.items()}
-    context_stats = {bigram: np.mean(scores) for bigram, scores in context_toxicity.items()}
-    
-    # Normalize scores
-    max_word_tox = max(word_stats.values())
-    max_context_tox = max(context_stats.values()) if context_stats else max_word_tox
-    
-    word_stats = {w: s/max_word_tox for w, s in word_stats.items()}
-    context_stats = {b: s/max_context_tox for b, s in context_stats.items()}
-    
-    default_score = np.mean(list(text_scores.values()))
-    scores = []
-    
-    for text in examples:
-        words = [w for w in text.split() if w != 'MASKED']
-        if not words:
-            scores.append(default_score)
-            continue
-        
-        # Get base toxicity scores
-        word_scores = [word_stats.get(w, 0.5) for w in words]
-        
-        # Calculate position importance (U-shaped curve)
-        n = len(word_scores)
-        position_weights = [1.0 + 0.3 * (1 - min(i, n-1-i)/(n/2)) for i in range(n)]
-        
-        # Apply position weighting
-        weighted_scores = [s * w for s, w in zip(word_scores, position_weights)]
-        
-        # Consider contextual effects (bigrams)
-        context_boost = 0
-        if len(words) > 1:
-            for i in range(len(words)-1):
-                bigram = (words[i], words[i+1])
-                if bigram in context_stats:
-                    context_boost += context_stats[bigram] * 0.2
-        
-        # Apply repetition decay for toxic words
-        seen_toxic = set()
-        decay_factor = 0.8
-        for i, (word, score) in enumerate(zip(words, weighted_scores)):
-            if score > 0.6:  # Toxic word threshold
-                if word in seen_toxic:
-                    weighted_scores[i] *= decay_factor
-                seen_toxic.add(word)
-        
-        # Calculate final score using both individual and contextual toxicity
-        base_score = np.mean(weighted_scores)
-        context_adjusted = base_score + context_boost
-        
-        # Apply non-linear scaling
-        final_score = 1 / (1 + np.exp(-6 * (context_adjusted - 0.5)))
-        final_score = min(1.0, final_score)
-        
-        # Apply mask penalty if needed
-        if 'MASKED' in text:
-            mask_ratio = len([w for w in text.split() if w == 'MASKED']) / len(text.split())
-            final_score *= (1 - 0.5 * mask_ratio)
-        
-        scores.append(final_score)
-    
-    return np.array(scores).reshape(-1, 1)
-
-class XGBoostSurrogate:
-    """Model wrapper for XGBoost that provides consistent interface for LIME analysis"""
-    def __init__(self):
+class ToxicityModel:
+    """Model wrapper for toxicity prediction that supports both XGBoost and Linear Regression"""
+    def __init__(self, use_xgboost=True):
         self.vectorizer = TfidfVectorizer(
             max_features=2000, 
             ngram_range=(1,2),
-            min_df=5  # Minimum document frequency similar to shap_analysis
+            min_df=TEST_CONFIG['min_word_frequency']
         )
-        self.model = xgb.XGBRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,  # L1 regularization for sparse features
-            reg_lambda=1.0,  # L2 regularization
-            random_state=42
-        )
+        self.use_xgboost = use_xgboost
+        if use_xgboost:
+            self.model = xgb.XGBRegressor(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,  # L1 regularization for sparse features
+                reg_lambda=1.0,  # L2 regularization
+                random_state=42
+            )
+        else:
+            self.model = LinearRegression()
         self.X_train_mean = None
 
     def fit(self, texts, scores):
@@ -301,36 +71,28 @@ class XGBoostSurrogate:
         X = self.vectorizer.fit_transform(texts)
         self.X_train_mean = X.mean(axis=0)
         
-        # Fit XGBoost model
+        # Fit model
         self.model.fit(X, scores)
         return self
         
-    def predict_proba(self, texts):
-        """Predict scores for LIME - for regression, return the predictions directly"""
+    def predict(self, texts):
+        """Predict scores for texts - returns format expected by LIME"""
         X = self.vectorizer.transform(texts)
-        return self.model.predict(X)
+        predictions = self.model.predict(X)
+        # Ensure predictions are in [0,1] range
+        predictions = np.clip(predictions, 0, 1)
+        # Reshape to 2D array with one column for LIME
+        return predictions.reshape(-1, 1)
 
-def aggregate_word_importances(examples, scorer, num_features=20):
-    """Use LIME with XGBoost surrogate to explain toxicity scores
-    
-    Process:
-    1. LIME creates perturbations of each text by randomly masking words
-    2. Get toxicity scores for all perturbations 
-    3. Train local linear model to approximate how words affect toxicity
-    4. Extract and aggregate word importance scores across examples
-    
-    Args:
-        examples: List of text examples to analyze
-        scorer: Function that returns toxicity scores for texts
-        num_features: Number of top/bottom words to return
-    Returns:
-        top_positive, top_negative: Lists of (word, score) tuples
+def calculate_lime_values(text: str, model: ToxicityModel) -> dict:
     """
-    # Initialize and fit surrogate model
-    surrogate = XGBoostSurrogate()
-    base_scores = scorer(examples).flatten()
-    print("Training XGBoost surrogate model...")
-    surrogate.fit(examples, base_scores)
+    Calculate LIME values for words in the text
+    """
+    print(f"\nAnalyzing text: {text[:100]}...")
+    
+    # Get baseline score
+    baseline_score = model.predict([text])[0][0]  # Note the [0][0] to get scalar value
+    print(f"Baseline toxicity score: {baseline_score:.4f}")
     
     # Configure LIME explainer
     explainer = LimeTextExplainer(
@@ -341,91 +103,195 @@ def aggregate_word_importances(examples, scorer, num_features=20):
         random_state=42
     )
     
-    word_scores = defaultdict(float)
-    importance_weights = np.linspace(1.0, 0.5, len(examples))
-    
-    print(f"Analyzing {len(examples)} examples...")
-    for i, (text, weight) in enumerate(zip(examples, importance_weights)):
-        if i % 100 == 0:
-            print(f"Processing example {i+1}/{len(examples)}...")
-        
-        # For regression, we don't need labels parameter
-        exp = explainer.explain_instance(
-            text,
-            surrogate.predict_proba,
-            num_features=min(100, len(text.split())),
-            num_samples=2000
-        )
-        
-        # For regression, exp.as_list() doesn't need a label parameter
-        for word, score in exp.as_list():
-            clean = clean_word(word)
-            if clean and clean not in STOPWORDS:
-                word_scores[clean] += score * weight
-    
-    # Scale final scores to [-1,1] range for interpretability
-    max_score = max(abs(score) for score in word_scores.values()) if word_scores else 1
-    scaled_scores = {word: score/max_score for word, score in word_scores.items()}
-    
-    # Sort words by importance score
-    sorted_words = sorted(scaled_scores.items(), key=lambda x: x[1], reverse=True)
-    top_positive = sorted_words[:num_features]  # Words that increase toxicity
-    top_negative = sorted_words[-num_features:][::-1]  # Words that decrease toxicity
-
-    return top_positive, top_negative
-
-def plot_word_importances(word_scores, title):
-    """Plot horizontal bar chart of word importance scores and save to PNG."""
-    if not word_scores:
-        print(f"No words to plot for: {title}")
-        return
-        
-    words = [str(word) for word, _ in word_scores]
-    scores = [score for _, score in word_scores]
-    
-    plt.figure(figsize=(12, 8))
-    bars = plt.barh(words, scores, color=['skyblue' if s > 0 else 'salmon' for s in scores])
-    plt.xlabel('Aggregated LIME Score', fontsize=10)
-    plt.ylabel('Words', fontsize=10)
-    plt.title(title, fontsize=12, pad=20)
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
-    plt.gca().invert_yaxis()
-    
-    for bar in bars:
-        width = bar.get_width()
-        plt.text(width, bar.get_y() + bar.get_height()/2,
-                f'{width:.3f}', ha='left', va='center', fontsize=8)
-    
-    plt.tight_layout()
-    
-    # Create filename from title (remove spaces and special characters)
-    filename = "".join(x for x in title if x.isalnum()) + '.png'
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    plt.close()  # Close the figure to free memory
-    print(f"Saved plot to {filename}")
-
-def main():
-    # Sample 999 random examples from non-empty texts
-    mask = df['comment_text'].str.strip().str.len() > 0
-    sampled_df = df[mask].sample(n=999, random_state=42)
-    examples = sampled_df['comment_text'].tolist()
-    
-    # Get toxicity scores using different methods
-    print("Calculating toxicity scores...")
-    scores_nonlinear = get_toxicity_scores(examples)
-    scores_idf = get_toxicity_scores_idf_weighted(examples)
-    scores_avg_nonlinear = get_toxicity_scores_avg_nonlinear(examples)
-    scores_weighted = get_weighted_toxicity_scores(examples)
-    
-    # Aggregate word importances using LIME
-    print("Aggregating word importances...")
-    top_positive, top_negative = aggregate_word_importances(
-        examples, get_weighted_toxicity_scores, num_features=20
+    # Get LIME explanation
+    exp = explainer.explain_instance(
+        text,
+        model.predict,
+        num_features=min(100, len(text.split())),
+        num_samples=2000,
+        labels=(0,)  # Specify we want explanation for the first (and only) class
     )
     
-    # Plot word importances
-    plot_word_importances(top_positive, "Top Positive Words for Toxicity")
-    plot_word_importances(top_negative, "Top Negative Words for Toxicity")
+    try:
+        # Get explanation for the first class (index 0)
+        explanation_list = exp.as_list(label=0)
+        
+        # Clean and normalize words in the explanation
+        cleaned_explanation = [(clean_word(word), value) for word, value in explanation_list]
+        
+        # Create results DataFrame
+        results_df = pd.DataFrame(cleaned_explanation, columns=['word', 'lime_value'])
+        results_df['contributes_to_toxicity'] = results_df['lime_value'] > 0
+        results_df['absolute_impact'] = abs(results_df['lime_value'])
+        
+        # Sort by absolute impact
+        results_df = results_df.reindex(results_df['absolute_impact'].sort_values(ascending=False).index)
+        
+        return {
+            "baseline_score": baseline_score,
+            "results": results_df,
+            "text": text
+        }
+    except Exception as e:
+        print(f"Error getting LIME explanation: {str(e)}")
+        # Return empty results if explanation fails
+        return {
+            "baseline_score": baseline_score,
+            "results": pd.DataFrame(columns=['word', 'lime_value', 'contributes_to_toxicity', 'absolute_impact']),
+            "text": text
+        }
+
+def visualize_explanation(word_summary_df: pd.DataFrame, output_prefix: str = 'lime_api'):
+    """Create visualizations for the overall LIME explanation"""
+    # Add model type to output prefix
+    model_type = "xgboost" if TEST_CONFIG['use_xgboost'] else "linear"
+    output_prefix = f"{output_prefix}_{model_type}"
+    
+    # Filter out common words and short words
+    word_summary_df = word_summary_df[
+        (~word_summary_df['word'].isin(TEST_CONFIG['common_words'])) &
+        (word_summary_df['word'].str.len() > 3)
+    ]
+    
+    # Separate positive and negative impacts
+    positive_impacts = word_summary_df[word_summary_df['mean_impact'] > 0].sort_values('mean_impact', ascending=False)
+    negative_impacts = word_summary_df[word_summary_df['mean_impact'] < 0].sort_values('mean_impact')
+    
+    # 1. Top positive contributors
+    plt.figure(figsize=(15, 10))
+    top_positive = positive_impacts.head(TEST_CONFIG['top_n_words'])
+    plt.barh(range(len(top_positive)), top_positive['mean_impact'], color='red')
+    plt.yticks(range(len(top_positive)), top_positive['word'])
+    plt.xlabel('Mean LIME Value')
+    plt.title('Top Words Increasing Toxicity')
+    plt.grid(axis='x', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_positive_contributors.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 2. Top negative contributors
+    plt.figure(figsize=(15, 10))
+    top_negative = negative_impacts.head(TEST_CONFIG['top_n_words'])
+    plt.barh(range(len(top_negative)), top_negative['mean_impact'], color='blue')
+    plt.yticks(range(len(top_negative)), top_negative['word'])
+    plt.xlabel('Mean LIME Value')
+    plt.title('Top Words Decreasing Toxicity')
+    plt.grid(axis='x', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_negative_contributors.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 3. Impact distribution
+    plt.figure(figsize=(15, 10))
+    plt.hist(word_summary_df['mean_impact'], bins=50, color='gray', alpha=0.7)
+    plt.xlabel('Mean LIME Value')
+    plt.ylabel('Number of Words')
+    plt.title('Distribution of Word Impacts')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_impact_distribution.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def main():
+    print("Starting LIME analysis...")
+    print(f"Using {'XGBoost' if TEST_CONFIG['use_xgboost'] else 'Linear Regression'} model")
+    
+    # Sample texts from dataset
+    mask = df['comment_text'].str.strip().str.len() > 0
+    sampled_df = df[mask].sample(n=TEST_CONFIG['max_samples'], random_state=42)
+    examples = sampled_df['comment_text'].tolist()
+    
+    # Initialize and fit model
+    print("\nFitting model on training data...")
+    model = ToxicityModel(use_xgboost=TEST_CONFIG['use_xgboost'])
+    model.fit(examples, sampled_df['toxicity_score'].values)
+    
+    # Analyze examples
+    all_explanations = []
+    word_impacts = {}  # Dictionary to track word impacts across all texts
+    
+    for i, text in enumerate(examples):
+        print(f"\n{'='*60}")
+        print(f"Analyzing example {i+1}/{len(examples)}")
+        print(f"{'='*60}")
+        
+        try:
+            explanation = calculate_lime_values(text, model)
+            
+            # Update word impacts dictionary
+            for _, row in explanation["results"].iterrows():
+                word = row['word']
+                if word not in word_impacts:
+                    word_impacts[word] = []
+                word_impacts[word].append({
+                    'lime_value': row['lime_value'],
+                    'text': text[:100] + "..."
+                })
+            
+            all_explanations.append(explanation)
+            
+        except Exception as e:
+            print(f"Error analyzing text: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Create overall word impact summary
+    print("\nCreating overall word impact summary...")
+    word_summary = []
+    for word, impacts in word_impacts.items():
+        if len(impacts) < TEST_CONFIG['min_word_frequency']:
+            continue
+            
+        lime_values = [imp['lime_value'] for imp in impacts]
+        
+        # Calculate statistics on the LIME values
+        mean_impact = np.mean(lime_values)
+        std_impact = np.std(lime_values)
+        max_impact = np.max(lime_values)
+        min_impact = np.min(lime_values)
+        
+        word_summary.append({
+            'word': word,
+            'mean_impact': mean_impact,
+            'std_impact': std_impact,
+            'frequency': len(impacts),
+            'max_impact': max_impact,
+            'min_impact': min_impact,
+            'impact_range': max_impact - min_impact
+        })
+    
+    # Convert to DataFrame and sort by absolute mean impact
+    word_summary_df = pd.DataFrame(word_summary)
+    if not word_summary_df.empty:
+        # Filter out words with very small impacts
+        word_summary_df = word_summary_df[abs(word_summary_df['mean_impact']) > 0.001]
+        
+        # Sort by absolute impact
+        word_summary_df = word_summary_df.reindex(
+            word_summary_df['mean_impact'].abs().sort_values(ascending=False).index
+        )
+        
+        # Save overall summary with model type in filename
+        model_type = "xgboost" if TEST_CONFIG['use_xgboost'] else "linear"
+        word_summary_df.to_csv(f'lime_api_word_analysis_{model_type}.csv', index=False)
+        
+        # Print separate summaries for positive and negative impacts
+        print("\nTop 10 words increasing toxicity:")
+        positive_impacts = word_summary_df[word_summary_df['mean_impact'] > 0].head(10)
+        print(positive_impacts[['word', 'mean_impact', 'std_impact', 'frequency', 'impact_range']])
+        
+        print("\nTop 10 words decreasing toxicity:")
+        negative_impacts = word_summary_df[word_summary_df['mean_impact'] < 0].head(10)
+        print(negative_impacts[['word', 'mean_impact', 'std_impact', 'frequency', 'impact_range']])
+        
+        print(f"\nDetailed results saved to 'lime_api_word_analysis_{model_type}.csv'")
+        
+        # Create visualizations
+        visualize_explanation(word_summary_df)
+    
+    print(f"\nAnalysis complete! Analyzed {len(all_explanations)} texts.")
+    print(f"Found {len(word_summary_df)} unique words that appeared at least {TEST_CONFIG['min_word_frequency']} times.")
 
 if __name__ == "__main__":
     main()
