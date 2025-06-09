@@ -9,16 +9,19 @@ import time
 import re
 from typing import List, Union
 from sklearn.feature_extraction.text import CountVectorizer
+import xgboost as xgb
+from sklearn.linear_model import LinearRegression
 
 # Configuration variables for testing
 TEST_CONFIG = {
-    'max_samples': 1000,  # Number of texts to analyze (500 toxic + 500 non-toxic)
+    'max_samples': 500,  # Number of texts to analyze (500 toxic + 500 non-toxic)
     'max_words': 50,    # Maximum number of words to analyze per text
     'rate_limit_delay': 1.2,  # Delay between API calls in seconds
     'min_word_frequency': 5,  # Minimum number of times a word must appear to be included in analysis
     'top_n_words': 20,   # Number of top words to show in concise visualizations
     'detailed_top_n_words': 100,  # Number of words to show in detailed visualizations
     'max_word_length': 3,  # Minimum word length to consider
+    'use_xgboost': True,  # Flag to use XGBoost instead of linear regression
     'common_words': {  # Words to exclude from analysis
         'the', 'and', 'that', 'have', 'for', 'not', 'this', 'but', 'with', 'you', 'from', 'they',
         'say', 'will', 'one', 'all', 'would', 'there', 'their', 'what', 'about', 'which', 'when',
@@ -92,11 +95,11 @@ def tokenize_text(text: str) -> List[str]:
     return [token for token in tokens if token.strip()]
 
 class PerspectiveModel:
-    """Simple linear model wrapper for Perspective API"""
-    def __init__(self):
+    """Model wrapper for Perspective API that supports both linear and XGBoost models"""
+    def __init__(self, use_xgboost=True):
         self.vectorizer = CountVectorizer()
-        self.coefficients = None
-        self.intercept = None
+        self.use_xgboost = use_xgboost
+        self.model = None
         self.X_train_mean = None
         
     def fit(self, texts: List[str]):
@@ -117,35 +120,46 @@ class PerspectiveModel:
         
         # Transform texts to feature matrix
         X = self.vectorizer.transform(texts).toarray()
-        
-        # Fit a simple linear regression
-        from sklearn.linear_model import LinearRegression
-        model = LinearRegression()
-        model.fit(X, scores)
-        
-        self.coefficients = model.coef_
-        self.intercept = model.intercept_
         self.X_train_mean = X.mean(axis=0)
         
-        # Validate intercept is reasonable for 0-1 range
-        if self.intercept < 0 or self.intercept > 1:
-            print(f"Warning: Model intercept {self.intercept:.4f} outside expected range [0,1]")
-            # Adjust intercept to be within [0,1]
-            self.intercept = max(0, min(1, self.intercept))
+        if self.use_xgboost:
+            # Initialize and fit XGBoost model
+            self.model = xgb.XGBRegressor(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,  # L1 regularization helps with sparse features
+                reg_lambda=1.0,  # L2 regularization
+                random_state=42
+            )
+            self.model.fit(X, scores)
+        else:
+            # Use linear regression
+            self.model = LinearRegression()
+            self.model.fit(X, scores)
         
         return self
     
     def predict(self, texts: List[str]) -> np.ndarray:
         """Predict toxicity scores for new texts"""
         X = self.vectorizer.transform(texts).toarray()
-        predictions = self.intercept + np.dot(X, self.coefficients)
+        predictions = self.model.predict(X)
         # Ensure predictions are in [0,1] range
         return np.clip(predictions, 0, 1)
+    
+    def get_feature_importance(self):
+        """Get feature importance scores"""
+        if self.use_xgboost:
+            return self.model.feature_importances_
+        else:
+            return self.model.coef_
 
 def calculate_shap_values(text: str, model: PerspectiveModel) -> dict:
     """
     Calculate SHAP values for words in the text using both manual calculation
-    and SHAP's LinearExplainer
+    and SHAP's explainer
     """
     print(f"\nAnalyzing text: {text[:100]}...")
     
@@ -156,12 +170,6 @@ def calculate_shap_values(text: str, model: PerspectiveModel) -> dict:
     baseline_score = model.predict([text])[0]
     print(f"Baseline toxicity score: {baseline_score:.4f}")
     
-    # Calculate base value
-    base_value = model.intercept + np.sum(model.coefficients * model.X_train_mean)
-    # Ensure base value is in [0,1] range
-    base_value = max(0, min(1, base_value))
-    print(f"Base value: {base_value:.4f}")
-    
     # Get unique words in vocabulary
     words = model.vectorizer.get_feature_names_out()
     word_indices = {word: idx for idx, word in enumerate(words)}
@@ -171,12 +179,18 @@ def calculate_shap_values(text: str, model: PerspectiveModel) -> dict:
     selected_words = [word for word in text_words if word in word_indices][:TEST_CONFIG['max_words']]
     selected_indices = [word_indices[word] for word in selected_words]
     
-    # Calculate SHAP values using LinearExplainer
-    explainer = shap.LinearExplainer(
-        (model.coefficients, model.intercept),
-        shap.maskers.Independent(model.X_train_mean.reshape(1, -1))
-    )
-    shap_values = explainer.shap_values(X.reshape(1, -1))[0]
+    # Calculate SHAP values using appropriate explainer
+    if model.use_xgboost:
+        # For XGBoost, we'll use a background dataset
+        background = model.X_train_mean.reshape(1, -1)
+        explainer = shap.TreeExplainer(model.model, background)
+        shap_values = explainer.shap_values(X.reshape(1, -1))[0]
+    else:
+        explainer = shap.LinearExplainer(
+            (model.model.coef_, model.model.intercept_),
+            shap.maskers.Independent(model.X_train_mean.reshape(1, -1))
+        )
+        shap_values = explainer.shap_values(X.reshape(1, -1))[0]
     
     # Create results DataFrame with corrected interpretation
     results_df = pd.DataFrame({
@@ -191,7 +205,6 @@ def calculate_shap_values(text: str, model: PerspectiveModel) -> dict:
     
     return {
         "baseline_score": baseline_score,
-        "base_value": base_value,
         "results": results_df,
         "shap_values_full": shap_values,
         "text": text
@@ -199,6 +212,10 @@ def calculate_shap_values(text: str, model: PerspectiveModel) -> dict:
 
 def visualize_explanation(word_summary_df: pd.DataFrame, output_prefix: str = 'perspective_api'):
     """Create visualizations for the overall SHAP explanation"""
+    # Add model type to output prefix
+    model_type = "xgboost" if TEST_CONFIG['use_xgboost'] else "linear"
+    output_prefix = f"{output_prefix}_{model_type}"
+    
     # Filter out common words and short words
     word_summary_df = word_summary_df[
         (~word_summary_df['word'].isin(TEST_CONFIG['common_words'])) &
@@ -278,11 +295,12 @@ def visualize_explanation(word_summary_df: pd.DataFrame, output_prefix: str = 'p
 
 # Main analysis
 print("Starting SHAP analysis of Perspective API...")
+print(f"Using {'XGBoost' if TEST_CONFIG['use_xgboost'] else 'Linear Regression'} model")
 print("This will make API calls and take time due to rate limits...")
 
 # First, fit the model on a subset of the data
 print("\nFitting model on training data...")
-model = PerspectiveModel()
+model = PerspectiveModel(use_xgboost=TEST_CONFIG['use_xgboost'])
 model.fit(df['comment_text'].tolist())
 
 # Analyze example texts
@@ -324,52 +342,41 @@ for i, text in enumerate(sample_texts):
 print("\nCreating overall word impact summary...")
 word_summary = []
 for word, impacts in word_impacts.items():
+    if len(impacts) < TEST_CONFIG['min_word_frequency']:
+        continue
+        
     shap_values = [imp['shap_value'] for imp in impacts]
-    texts = [imp['text'] for imp in impacts]
     
-    # Calculate the actual toxicity impact
-    # For each occurrence of the word, calculate how much it increased/decreased toxicity
-    toxicity_impacts = []
-    for i, (shap_val, text) in enumerate(zip(shap_values, texts)):
-        # Get the toxicity score for the full text
-        full_text_score = get_toxicity_score(text)
-        
-        # Create a version of the text without this word
-        words = tokenize_text(text)
-        words_without = [w for w in words if w != word]
-        text_without = ' '.join(words_without)
-        
-        # Get the toxicity score without this word
-        score_without = get_toxicity_score(text_without)
-        
-        # Calculate the actual impact on toxicity
-        toxicity_impact = full_text_score - score_without
-        toxicity_impacts.append(toxicity_impact)
-    
-    # Calculate statistics on the actual toxicity impacts
-    mean_impact = np.mean(toxicity_impacts)
-    std_impact = np.std(toxicity_impacts)
+    # Calculate statistics on the SHAP values
+    mean_impact = np.mean(shap_values)
+    std_impact = np.std(shap_values)
+    max_impact = np.max(shap_values)
+    min_impact = np.min(shap_values)
     
     word_summary.append({
         'word': word,
         'mean_impact': mean_impact,
         'std_impact': std_impact,
         'frequency': len(impacts),
-        'max_impact': max(toxicity_impacts),
-        'min_impact': min(toxicity_impacts),
-        'impact_range': max(toxicity_impacts) - min(toxicity_impacts)
+        'max_impact': max_impact,
+        'min_impact': min_impact,
+        'impact_range': max_impact - min_impact
     })
 
 # Convert to DataFrame and sort by absolute mean impact
 word_summary_df = pd.DataFrame(word_summary)
 if not word_summary_df.empty:
+    # Filter out words with very small impacts
+    word_summary_df = word_summary_df[abs(word_summary_df['mean_impact']) > 0.001]
+    
     # Sort by absolute impact
     word_summary_df = word_summary_df.reindex(
         word_summary_df['mean_impact'].abs().sort_values(ascending=False).index
     )
     
-    # Save overall summary
-    word_summary_df.to_csv('perspective_api_word_analysis.csv', index=False)
+    # Save overall summary with model type in filename
+    model_type = "xgboost" if TEST_CONFIG['use_xgboost'] else "linear"
+    word_summary_df.to_csv(f'perspective_api_word_analysis_{model_type}.csv', index=False)
     
     # Print separate summaries for positive and negative impacts
     print("\nTop 10 words increasing toxicity:")
@@ -380,7 +387,7 @@ if not word_summary_df.empty:
     negative_impacts = word_summary_df[word_summary_df['mean_impact'] < 0].head(10)
     print(negative_impacts[['word', 'mean_impact', 'std_impact', 'frequency', 'impact_range']])
     
-    print("\nDetailed results saved to 'perspective_api_word_analysis.csv'")
+    print(f"\nDetailed results saved to 'perspective_api_word_analysis_{model_type}.csv'")
     
     # Create visualizations
     visualize_explanation(word_summary_df)
